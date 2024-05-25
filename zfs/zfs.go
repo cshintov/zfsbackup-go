@@ -110,6 +110,15 @@ func GetZFSProperty(ctx context.Context, prop, target string) (string, error) {
 	return strings.TrimSpace(b.String()), nil
 }
 
+// GetDatasetSize returns the size of the given ZFS dataset.
+func GetDatasetSize(ctx context.Context, dataset string) (uint64, error) {
+	sizeStr, err := GetZFSProperty(ctx, "used", dataset)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseUint(sizeStr, 10, 64)
+}
+
 // GetZFSSendCommand will return the send command to use for the given JobInfo
 func GetZFSSendCommand(ctx context.Context, j *files.JobInfo) *exec.Cmd {
 	// Prepare the zfs send command

@@ -38,8 +38,10 @@ import (
 
 	"github.com/cenkalti/backoff"
 	"github.com/dustin/go-humanize"
+	"github.com/k0kubun/go-ansi"
 	"github.com/miolini/datacounter"
 	"github.com/nightlyone/lockfile"
+	"github.com/schollz/progressbar/v3"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/someone1/zfsbackup-go/backends"
@@ -320,6 +322,7 @@ func Backup(pctx context.Context, jobInfo *files.JobInfo) error {
 
 	// Prepare backends and setup plumbing
 	for _, destination := range jobInfo.Destinations {
+		log.AppLogger.Infof("Initializing backend for destination %s", destination)
 		backend, berr := prepareBackend(ctx, jobInfo, destination, uploadBuffer)
 		if berr != nil {
 			log.AppLogger.Errorf("Could not initialize backend due to error - %v.", berr)
@@ -416,15 +419,18 @@ func Backup(pctx context.Context, jobInfo *files.JobInfo) error {
 	} else {
 		fmt.Fprintf(
 			config.Stdout,
-			"Done.\n\tTotal ZFS Stream Bytes: %d (%s)\n\tTotal Bytes Written: %d (%s)\n\tElapsed Time: %v\n\tTotal Files Uploaded: %d\n",
+			"Done.\n\tTotal ZFS Stream Bytes: %d (%s)\n\tTotal Bytes Written: %d (%s)\n\tElapsed Time: %v\n\tTotal Files Uploaded: %d\n\tAverage Upload Rate: %s\n",
 			jobInfo.ZFSStreamBytes,
 			humanize.IBytes(jobInfo.ZFSStreamBytes),
 			totalWrittenBytes,
 			humanize.IBytes(totalWrittenBytes),
 			time.Since(jobInfo.StartTime),
 			len(jobInfo.Volumes)+1,
+			fmt.Sprintf("%.2f TB/hr", float64(totalWrittenBytes)/1e12/time.Since(jobInfo.StartTime).Hours()),
 		)
 	}
+
+	fmt.Printf("Backup of %s completed successfully.\n", jobInfo.VolumeName)
 
 	log.AppLogger.Debugf("Cleaning up resources...")
 
@@ -478,6 +484,7 @@ func saveManifest(ctx context.Context, j *files.JobInfo, final bool) (*files.Vol
 }
 
 // nolint:funlen,gocyclo // Difficult to break this apart
+
 func sendStream(ctx context.Context, j *files.JobInfo, c chan<- *files.VolumeInfo, buffer <-chan bool) error {
 	var group *errgroup.Group
 	group, ctx = errgroup.WithContext(ctx)
@@ -492,6 +499,39 @@ func sendStream(ctx context.Context, j *files.JobInfo, c chan<- *files.VolumeInf
 	if j.MaxFileBuffer == 0 {
 		usingPipe = true
 	}
+
+	// Get total dataset size for progress tracking
+	totalSize, err := zfs.GetDatasetSize(ctx, j.VolumeName)
+	if err != nil {
+		return err
+	}
+
+	// Initialize progress bar
+	bar := progressbar.NewOptions64(int64(totalSize),
+		progressbar.OptionSetWriter(ansi.NewAnsiStdout()),
+		progressbar.OptionEnableColorCodes(true),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionSetWidth(50),
+		progressbar.OptionThrottle(65*time.Millisecond),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetDescription("[cyan]Backing up...[reset]"),
+		progressbar.OptionOnCompletion(func() {
+			fmt.Fprint(ansi.NewAnsiStdout(), "\n")
+		}),
+		progressbar.OptionSpinnerType(14),
+		progressbar.OptionFullWidth(),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "[green]=[reset]",
+			SaucerHead:    "[green]>[reset]",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+
+	// Initialize chunk tracking variables
+	totalChunks := int(totalSize / (j.VolumeSize * humanize.MiByte))
+	var processedChunks int
 
 	group.Go(func() error {
 		var lastTotalBytes uint64
@@ -527,6 +567,8 @@ func sendStream(ctx context.Context, j *files.JobInfo, c chan<- *files.VolumeInf
 					if !usingPipe {
 						c <- volume
 					}
+					processedChunks++
+					bar.Describe(fmt.Sprintf("Backing up... (%d/%d chunks)", processedChunks, totalChunks))
 				}
 				<-buffer
 				volume, err = files.CreateBackupVolume(ctx, j, volNum)
@@ -542,7 +584,7 @@ func sendStream(ctx context.Context, j *files.JobInfo, c chan<- *files.VolumeInf
 			}
 
 			// Write a little at a time and break the output between volumes as needed
-			_, ierr := io.CopyN(volume, counter, files.BufferSize*2)
+			bytesWritten, ierr := io.CopyN(volume, counter, files.BufferSize*2)
 			if ierr == io.EOF {
 				// We are done!
 				log.AppLogger.Debugf("Finished creating volume %s", volume.ObjectName)
@@ -554,17 +596,21 @@ func sendStream(ctx context.Context, j *files.JobInfo, c chan<- *files.VolumeInf
 				if !usingPipe {
 					c <- volume
 				}
+				processedChunks++
+				bar.Describe(fmt.Sprintf("Backing up... (%d/%d chunks)", processedChunks, totalChunks))
 				return nil
 			} else if ierr != nil {
 				log.AppLogger.Errorf("Error while trying to read from the zfs stream for volume %s - %v", volume.ObjectName, ierr)
 				return ierr
 			}
+			// Update progress bar
+			bar.Add64(int64(bytesWritten))
 		}
 	})
 
 	// Start the zfs send command
 	log.AppLogger.Infof("Starting zfs send command: %s", strings.Join(cmd.Args, " "))
-	err := cmd.Start()
+	err = cmd.Start()
 	if err != nil {
 		log.AppLogger.Errorf("Error starting zfs command - %v", err)
 		return err
